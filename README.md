@@ -6,10 +6,9 @@ no API key, data under CC BY 4.0).
 
 ![Screenshot](screenshot.png)
 
-It is also an example of the launcher's proposed **HTTP interface** (HTTPS requests done by the
-launcher, [giltal/ESP32_P4_Launcher#13](https://github.com/giltal/ESP32_P4_Launcher/issues/13)):
-`PAPP_MF_WIFI` in the manifest keeps Wi-Fi on while the app runs, and `papp_http_get()` fetches the
-forecast. On a launcher without that interface the app says so instead of showing the weather.
+It is also an example of the launcher's **NET interface** (launcher 0.29 or newer): `up()` joins the
+board's saved network, and `http_open()` / `http_read()` fetch the forecast over HTTPS. On an older
+launcher the app says so instead of showing the weather.
 
 ## Use
 
@@ -28,8 +27,8 @@ forecast. On a launcher without that interface the app says so instead of showin
 
 ## Build
 
-Needs the RISC-V toolchain of ESP-IDF (as for the launcher's own apps) and a launcher checkout with the
-HTTP interface:
+Needs the RISC-V toolchain of ESP-IDF (as for the launcher's own apps) and a launcher checkout, 0.29 or
+newer:
 
 ```
 python build.py ../ESP32_P4_Launcher       # or set P4_LAUNCHER
@@ -43,7 +42,7 @@ python ../ESP32_P4_Launcher/tools/papp_dev.py --port <port> deploy build/weather
 ```
 
 `papp_text.h` is a small header-only text renderer (the launcher's 8x16 font plus °, umlauts and
-smooth big digits), kept here so the app needs nothing from the SDK beyond the HTTP interface.
+smooth big digits), kept here so the app needs nothing from the SDK beyond the NET interface.
 
 ## License
 

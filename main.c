@@ -1,7 +1,7 @@
 /*
  * Weather — current conditions and a 5-day forecast from Open-Meteo (open-meteo.com,
- * free for non-commercial use, data under CC BY 4.0). An example of the launcher's HTTP
- * interface: PAPP_MF_WIFI keeps Wi-Fi on while it runs, papp_http_get() fetches the forecast.
+ * free for non-commercial use, data under CC BY 4.0). An example of the launcher's NET
+ * interface (launcher 0.29+): up() joins the saved network, http_open/http_read fetch the forecast.
  *
  * Place and units: weather.txt in the app's data folder (/sd/data/chneeb.weather), written
  * with Munich on the first start.
@@ -20,7 +20,7 @@
 #include <string.h>
 
 PAPP_MANIFEST(.id = "chneeb.weather", .name = "Weather", .version = PAPP_APP_VERSION,
-              .main_stack = 32768, .flags = PAPP_MF_WIFI);
+              .main_stack = 32768);
 
 #define W 800
 #define H 480
@@ -242,8 +242,34 @@ static void url_encode(char *out, size_t n, const char *s)
     out[o] = 0;
 }
 
+/* GET url into buf, NUL-terminated: the HTTP status, or a PAPP_E_* code (NOT_CONNECTED when
+ * Wi-Fi doesn't come up, LIMIT when the answer doesn't fit) */
+static int http_get(const char *url, char *buf, size_t max)
+{
+    const papp_if_net_t *net = papp_net();
+    buf[0] = 0;
+    if (!net) return PAPP_E_UNSUPPORTED;
+    int st = net->up(20000);                      /* the first NET call keeps Wi-Fi on for the run */
+    if (st == PAPP_E_EXIT) return st;
+    if (st != PAPP_E_OK) return PAPP_E_NOT_CONNECTED;
+    papp_http_req_t req = { .url = url, .timeout_ms = 20000 };
+    papp_http_t *h = net->http_open(&req, &st);
+    if (!h) return st;
+    size_t n = 0;
+    int r = 0;
+    while (n < max - 1 && (r = net->http_read(h, buf + n, max - 1 - n)) > 0) n += (size_t)r;
+    buf[n] = 0;
+    if (r < 0) st = r;
+    else if (n == max - 1) {
+        char c;
+        if (net->http_read(h, &c, 1) > 0) st = PAPP_E_LIMIT;
+    }
+    net->http_close(h);
+    return st;
+}
+
 /* place "City[, country or region]" -> name, lat, lon via Open-Meteo's geocoding search.
- * Returns the HTTP status (200 with a match), 404 when nothing matches, or a PAPP_HTTP_ERR_* */
+ * Returns the HTTP status (200 with a match), 404 when nothing matches, or a PAPP_E_* */
 static int geocode(void)
 {
     char city[64], filter[64] = "", enc[192], url[320];
@@ -259,7 +285,7 @@ static int geocode(void)
     url_encode(enc, sizeof(enc), city);
     snprintf(url, sizeof(url), "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=20&language=en&format=json", enc);
     static char body[BODY_MAX];
-    int st = papp_http_get(url, body, sizeof(body), NULL, 20000);
+    int st = http_get(url, body, sizeof(body));
     if (st != 200) return st;
 
     const char *b, *e, *p;
@@ -295,8 +321,9 @@ static int geocode(void)
 
 static void net_error(const char *what, int st)
 {
-    if (!papp_if_http()) snprintf(s_status, sizeof(s_status), "Needs a launcher with HTTP");
-    else if (st == PAPP_HTTP_ERR_OFFLINE) snprintf(s_status, sizeof(s_status), "No Wi-Fi (Settings > Wi-Fi)");
+    if (!papp_net()) snprintf(s_status, sizeof(s_status), "Needs launcher 0.29 or newer");
+    else if (st == PAPP_E_NOT_CONNECTED) snprintf(s_status, sizeof(s_status), "No Wi-Fi (Settings > Wi-Fi)");
+    else if (st == PAPP_E_LIMIT) snprintf(s_status, sizeof(s_status), "Open-Meteo %s: answer too big", what);
     else if (st > 0) snprintf(s_status, sizeof(s_status), "Open-Meteo %s answered %d", what, st);
     else snprintf(s_status, sizeof(s_status), "No answer from Open-Meteo %s (%d)", what, st);
     papp_log("weather: %s failed: %d\n", what, st);
@@ -306,7 +333,7 @@ static void fetch(void)
 {
     if (place_changed()) {
         int st = geocode();
-        if (st == PAPP_HTTP_ERR_EXIT) return;
+        if (st == PAPP_E_EXIT) return;
         if (st == 404) {
             wx.ok = false;                       /* the old place's weather would mislead */
             snprintf(cfg.name, sizeof(cfg.name), "%.47s", cfg.place);   /* on screen only */
@@ -327,7 +354,7 @@ static void fetch(void)
              "&timezone=auto&forecast_days=%d%s",
              cfg.lat, cfg.lon, DAYS, cfg.imperial ? "&temperature_unit=fahrenheit&wind_speed_unit=mph" : "");
     static char body[BODY_MAX];
-    int st = papp_http_get(url, body, sizeof(body), NULL, 20000);
+    int st = http_get(url, body, sizeof(body));
     if (st == 200 && strstr(body, "\"current\":{")) {
         memcpy(s_body, body, sizeof(s_body));
         parse(s_body);
@@ -335,7 +362,7 @@ static void fetch(void)
         s_status[0] = 0;
         return;
     }
-    if (st == PAPP_HTTP_ERR_EXIT) return;
+    if (st == PAPP_E_EXIT) return;
     net_error("forecast", st);
 }
 
