@@ -3,13 +3,14 @@
  * free for non-commercial use, data under CC BY 4.0). An example of the launcher's NET
  * interface (launcher 0.29+): up() joins the saved network, http_open/http_read fetch the forecast.
  *
- * Place and units: weather.txt in the app's data folder (/sd/data/chneeb.weather), written
- * with Munich on the first start.
+ * Place and units: the menu (Place opens a keyboard and a list of matches), kept in
+ * weather.txt in the app's data folder (/sd/data/chneeb.weather), written with Munich on the
+ * first start.
  * place=City[, country or region] is looked up with Open-Meteo's geocoding search when it
  * changes; the result goes to name=, lat=, lon= (looked_up= remembers for which place).
  * Without place= (or with lat/lon edited by hand) the coordinates are used as they are.
  * The last answer is kept in cache.json beside it and shown when offline.
- * A = refresh, X / START or a tap = menu (Refresh, Units, Exit). Refreshes every 15 minutes.
+ * A = refresh, X / START or a tap = menu (Refresh, Place, Units, Exit). Refreshes every 15 minutes.
  */
 #include "papp/papp.h"
 #include "papp_text.h"
@@ -268,11 +269,63 @@ static int http_get(const char *url, char *buf, size_t max)
     return st;
 }
 
-/* place "City[, country or region]" -> name, lat, lon via Open-Meteo's geocoding search.
+typedef struct {
+    char name[48], admin1[48], country[48], cc[8];
+    float lat, lon;
+} place_t;
+
+/* Open-Meteo's geocoding search for a city name: up to max matches (best first) in out, their
+ * number in *count. Returns the HTTP status (200) or a PAPP_E_* */
+static int place_search(const char *city, int max, place_t *out, int *count)
+{
+    char enc[192], url[320];
+    *count = 0;
+    url_encode(enc, sizeof(enc), city);
+    snprintf(url, sizeof(url), "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=%d&language=en&format=json",
+             enc, max);
+    static char body[BODY_MAX];
+    int st = http_get(url, body, sizeof(body));
+    if (st != 200) return st;
+
+    const char *b, *e, *p;
+    if (!json_object(body, "results", &b, &e)) return st;         /* "results":[ ... ], none: no match */
+    for (p = b + 1; p < e && *count < max; ) {                     /* each {...} in the array */
+        const char *ob = strchr(p, '{');
+        if (!ob || ob > e) break;
+        const char *oe = ob;
+        for (int depth = 0; *oe; oe++) {
+            if (*oe == '{' || *oe == '[') depth++;
+            else if ((*oe == '}' || *oe == ']') && --depth == 0) break;
+        }
+        place_t *pl = &out[*count];
+        memset(pl, 0, sizeof(*pl));
+        json_str(ob, oe, "name", pl->name, sizeof(pl->name));
+        json_str(ob, oe, "country_code", pl->cc, sizeof(pl->cc));
+        json_str(ob, oe, "country", pl->country, sizeof(pl->country));
+        json_str(ob, oe, "admin1", pl->admin1, sizeof(pl->admin1));
+        if (json_num(ob, oe, "latitude", &pl->lat) && json_num(ob, oe, "longitude", &pl->lon)) (*count)++;
+        p = oe + 1;
+    }
+    return st;
+}
+
+/* The weather is for pl from now on; place is what the settings file calls it */
+static void use_place(const place_t *pl, const char *place)
+{
+    if (place != cfg.place) snprintf(cfg.place, sizeof(cfg.place), "%s", place);
+    snprintf(cfg.looked_up, sizeof(cfg.looked_up), "%s", cfg.place);
+    snprintf(cfg.name, sizeof(cfg.name), "%.47s", pl->name[0] ? pl->name : place);
+    snprintf(cfg.lat, sizeof(cfg.lat), "%.4f", pl->lat);
+    snprintf(cfg.lon, sizeof(cfg.lon), "%.4f", pl->lon);
+    papp_log("weather: %s -> %s, %s %s (%s, %s)\n", cfg.place, cfg.name, cfg.lat, cfg.lon, pl->admin1, pl->country);
+    config_save();
+}
+
+/* place "City[, country or region]" from the settings file -> name, lat, lon.
  * Returns the HTTP status (200 with a match), 404 when nothing matches, or a PAPP_E_* */
 static int geocode(void)
 {
-    char city[64], filter[64] = "", enc[192], url[320];
+    char city[64], filter[64] = "";
     snprintf(city, sizeof(city), "%s", cfg.place);
     char *comma = strrchr(city, ',');
     if (comma) {
@@ -282,51 +335,32 @@ static int geocode(void)
         snprintf(filter, sizeof(filter), "%s", f);
     }
     for (int n = (int)strlen(city); n > 0 && city[n - 1] == ' '; n--) city[n - 1] = 0;
-    url_encode(enc, sizeof(enc), city);
-    snprintf(url, sizeof(url), "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=20&language=en&format=json", enc);
-    static char body[BODY_MAX];
-    int st = http_get(url, body, sizeof(body));
+    static place_t found[20];
+    int n, st = place_search(city, 20, found, &n);
     if (st != 200) return st;
-
-    const char *b, *e, *p;
-    if (!json_object(body, "results", &b, &e)) return 404;       /* "results":[ ... ] */
-    for (p = b + 1; p < e; ) {                                     /* each {...} in the array */
-        const char *ob = strchr(p, '{');
-        if (!ob || ob > e) break;
-        const char *oe = ob;
-        for (int depth = 0; *oe; oe++) {
-            if (*oe == '{' || *oe == '[') depth++;
-            else if ((*oe == '}' || *oe == ']') && --depth == 0) break;
-        }
-        char name[48] = "", cc[8] = "", country[48] = "", admin1[48] = "";
-        float lat, lon;
-        json_str(ob, oe, "name", name, sizeof(name));
-        json_str(ob, oe, "country_code", cc, sizeof(cc));
-        json_str(ob, oe, "country", country, sizeof(country));
-        json_str(ob, oe, "admin1", admin1, sizeof(admin1));
-        bool match = !filter[0] || same_text(filter, cc) || same_text(filter, country) || same_text(filter, admin1);
-        if (match && json_num(ob, oe, "latitude", &lat) && json_num(ob, oe, "longitude", &lon)) {
-            snprintf(cfg.name, sizeof(cfg.name), "%.47s", name[0] ? name : city);
-            snprintf(cfg.lat, sizeof(cfg.lat), "%.4f", lat);
-            snprintf(cfg.lon, sizeof(cfg.lon), "%.4f", lon);
-            snprintf(cfg.looked_up, sizeof(cfg.looked_up), "%s", cfg.place);
-            papp_log("weather: %s -> %s, %s %s (%s, %s)\n", cfg.place, cfg.name, cfg.lat, cfg.lon, admin1, country);
-            config_save();
+    for (int i = 0; i < n; i++) {
+        const place_t *pl = &found[i];
+        if (!filter[0] || same_text(filter, pl->cc) || same_text(filter, pl->country) || same_text(filter, pl->admin1)) {
+            use_place(pl, cfg.place);
             return 200;
         }
-        p = oe + 1;
     }
     return 404;
 }
 
+static void net_error_text(char *out, size_t n, const char *what, int st)
+{
+    if (!papp_net()) snprintf(out, n, "Needs launcher 0.29 or newer");
+    else if (st == PAPP_E_NOT_CONNECTED) snprintf(out, n, "No Wi-Fi (Settings > Wi-Fi)");
+    else if (st == PAPP_E_LIMIT) snprintf(out, n, "Open-Meteo %s: answer too big", what);
+    else if (st > 0) snprintf(out, n, "Open-Meteo %s answered %d", what, st);
+    else snprintf(out, n, "No answer from Open-Meteo %s (%d)", what, st);
+    papp_log("weather: %s failed: %d\n", what, st);
+}
+
 static void net_error(const char *what, int st)
 {
-    if (!papp_net()) snprintf(s_status, sizeof(s_status), "Needs launcher 0.29 or newer");
-    else if (st == PAPP_E_NOT_CONNECTED) snprintf(s_status, sizeof(s_status), "No Wi-Fi (Settings > Wi-Fi)");
-    else if (st == PAPP_E_LIMIT) snprintf(s_status, sizeof(s_status), "Open-Meteo %s: answer too big", what);
-    else if (st > 0) snprintf(s_status, sizeof(s_status), "Open-Meteo %s answered %d", what, st);
-    else snprintf(s_status, sizeof(s_status), "No answer from Open-Meteo %s (%d)", what, st);
-    papp_log("weather: %s failed: %d\n", what, st);
+    net_error_text(s_status, sizeof(s_status), what, st);
 }
 
 static void fetch(void)
@@ -652,6 +686,237 @@ static void draw(bool busy)
     text_right(W - 12, H - 20, "Weather data: Open-Meteo.com", DIM_C, 1, false);
 }
 
+/* ── Place search: an on-screen keyboard (touch or pad) and USB keyboards ── */
+
+enum { K_CHAR, K_SPACE, K_DEL, K_CANCEL, K_SEARCH };
+
+typedef struct {
+    const char *lo, *up;                 /* what it types (UTF-8), or its label */
+    uint8_t kind, row, col, w;           /* col and w in key units, 10 per row  */
+} kkey_t;
+
+#define KB_U     78                      /* one key unit, gap included */
+#define KB_X0    ((W - 10 * KB_U + 6) / 2)
+#define KB_Y0    168
+#define KB_ROW_H 62
+#define KB_KEY_H 56
+#define FIELD_C  PAPP_RGB565(16, 38, 82)
+#define KEY_C    PAPP_RGB565(28, 62, 120)
+#define SEL_C    PAPP_RGB565(255, 200, 40)
+
+static kkey_t s_keys[48];
+static int s_nkeys;
+static papp_surface_t *s_surf;
+
+static void kb_build(void)
+{
+    static const char *const rows[] = { "1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm" };
+    static char chars[40][2][2];
+    static const char *const uml[][2] = { { "\xc3\xa4", "\xc3\x84" }, { "\xc3\xb6", "\xc3\x96" }, { "\xc3\xbc", "\xc3\x9c" } };
+    int k = 0;
+    s_nkeys = 0;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; rows[r][c]; c++, k++) {
+            char ch = rows[r][c];
+            chars[k][0][0] = ch;
+            chars[k][1][0] = ch >= 'a' && ch <= 'z' ? ch - 32 : ch;
+            s_keys[s_nkeys++] = (kkey_t){ chars[k][0], chars[k][1], K_CHAR, r, c, 1 };
+        }
+    for (int i = 0; i < 3; i++) s_keys[s_nkeys++] = (kkey_t){ uml[i][0], uml[i][1], K_CHAR, 3, 7 + i, 1 };
+    s_keys[s_nkeys++] = (kkey_t){ "Space", "Space", K_SPACE, 4, 0, 3 };
+    s_keys[s_nkeys++] = (kkey_t){ "Delete", "Delete", K_DEL, 4, 3, 2 };
+    s_keys[s_nkeys++] = (kkey_t){ "Cancel", "Cancel", K_CANCEL, 4, 5, 2 };
+    s_keys[s_nkeys++] = (kkey_t){ "Search", "Search", K_SEARCH, 4, 7, 3 };
+}
+
+static void kb_rect(const kkey_t *k, int *x, int *y, int *w)
+{
+    *x = KB_X0 + k->col * KB_U;
+    *y = KB_Y0 + k->row * KB_ROW_H;
+    *w = k->w * KB_U - 6;
+}
+
+static int kb_hit(int px, int py)
+{
+    for (int i = 0; i < s_nkeys; i++) {
+        int x, y, w;
+        kb_rect(&s_keys[i], &x, &y, &w);
+        if (px >= x - 3 && px < x + w + 3 && py >= y - 3 && py < y + KB_KEY_H + 3) return i;
+    }
+    return -1;
+}
+
+/* The key in the row above / below (dy) nearest to sel's middle */
+static int kb_move(int sel, int dx, int dy)
+{
+    const kkey_t *k = &s_keys[sel];
+    int row = k->row + dy, mid = k->col * 2 + k->w, best = sel, dist = 1000;
+    if (dx) {
+        int i = sel + dx;
+        return i >= 0 && i < s_nkeys && s_keys[i].row == k->row ? i : sel;
+    }
+    for (int i = 0; i < s_nkeys; i++) {
+        int d = abs(s_keys[i].col * 2 + s_keys[i].w - mid);
+        if (s_keys[i].row == row && d < dist) { best = i; dist = d; }
+    }
+    return best;
+}
+
+static bool kb_upper(const char *text)          /* capitals at the start of each word */
+{
+    size_t n = strlen(text);
+    return !n || text[n - 1] == ' ' || text[n - 1] == '-';
+}
+
+static void kb_draw(const char *text, int sel, int held, const char *msg)
+{
+    char s[96];
+    fill_gradient(0, H, 40, 96, 170, 110, 165, 220);
+    snprintf(s, sizeof(s), "Place (now %s)", cfg.name);
+    papp_text_smooth(&C, 24, 16, s, TEXT_C, 2);
+    papp_canvas_fill(&C, 24, 64, W - 48, 64, FIELD_C);
+    const char *t = text;                        /* the end of a long name stays in view */
+    while (papp_text_width(t, 3) > W - 96) papp_text_next(&t);
+    int x = papp_text_smooth(&C, 36, 72, t, TEXT_C, 3);
+    papp_canvas_fill(&C, x + 4, 74, 4, 44, SEL_C);
+    papp_text(&C, 26, 140, msg && msg[0] ? msg : "Type a city, then Search", msg && msg[0] ? WARN_C : DIM_C, 1);
+
+    bool up = kb_upper(text);
+    for (int i = 0; i < s_nkeys; i++) {
+        const kkey_t *k = &s_keys[i];
+        int kx, ky, kw;
+        kb_rect(k, &kx, &ky, &kw);
+        if (i == sel) papp_canvas_fill(&C, kx - 3, ky - 3, kw + 6, KB_KEY_H + 6, SEL_C);
+        papp_canvas_fill(&C, kx, ky, kw, KB_KEY_H, i == held ? PAPP_RGB565(70, 120, 200) : KEY_C);
+        papp_text_centered(&C, kx + kw / 2, ky + (KB_KEY_H - 32) / 2, up ? k->up : k->lo, TEXT_C, 2);
+    }
+}
+
+static void kb_append(char *text, size_t max, const char *add)
+{
+    size_t n = strlen(text), a = strlen(add);
+    if (n + a < max) memcpy(text + n, add, a + 1);
+}
+
+static void kb_delete(char *text)               /* the last character, whole if multi-byte */
+{
+    size_t n = strlen(text);
+    while (n > 0 && (text[n - 1] & 0xC0) == 0x80) n--;
+    if (n > 0) n--;
+    text[n] = 0;
+}
+
+/* Edits text (max bytes) until Search (true, text not empty) or Cancel / exit (false).
+ * msg (may be "") is shown under the field until the text changes. */
+static bool kb_edit(char *text, size_t max, char *msg)
+{
+    int sel = s_nkeys - 1, held = -1;            /* Search */
+    papp_touch_point_t tp = { 0 };
+    bool was_touch = false, dirty = true;
+    uint32_t prev = 0xFFFFFFFFu;                 /* what opened us stays ignored until released */
+    papp_input_flush();
+    while (!papp_exit_requested()) {
+        int act = -1;
+        size_t before = strlen(text);
+        papp_input_event_t ev;
+        while (papp_input_poll_event(&ev)) {     /* USB keyboard (US layout) */
+            if (ev.type != PAPP_EV_KEY_DOWN) continue;
+            if (ev.code == 0x28 || ev.code == 0x58) { if (text[0]) return true; }   /* Enter */
+            else if (ev.code == 0x29) return false;                                  /* Esc */
+            else if (ev.code == 0x2A) kb_delete(text);                               /* Backspace */
+            else if (ev.text >= 32 && ev.text < 127) { char c[2] = { (char)ev.text, 0 }; kb_append(text, max, c); }
+            dirty = true;
+        }
+
+        papp_gamepad_t pad = { 0 };
+        papp_input_gamepad(0, &pad);
+        uint32_t press = pad.buttons & ~prev;
+        prev = pad.buttons;
+        int moved = sel;
+        if (press & PAPP_BTN_LEFT) sel = kb_move(sel, -1, 0);
+        if (press & PAPP_BTN_RIGHT) sel = kb_move(sel, 1, 0);
+        if (press & PAPP_BTN_UP) sel = kb_move(sel, 0, -1);
+        if (press & PAPP_BTN_DOWN) sel = kb_move(sel, 0, 1);
+        if (sel != moved) dirty = true;
+        if (press & PAPP_BTN_A) act = sel;
+        if (press & PAPP_BTN_B) {
+            if (!text[0]) return false;
+            kb_delete(text);
+            dirty = true;
+        }
+        if ((press & PAPP_BTN_START) && text[0]) return true;
+
+        papp_touch_point_t t;
+        bool touch = papp_disp_touch(s_surf, &t, 1) > 0;
+        if (touch) tp = t;
+        int h = touch ? kb_hit(tp.x, tp.y) : -1;
+        if (!touch && was_touch) act = kb_hit(tp.x, tp.y);
+        was_touch = touch;
+        if (h != held) { held = h; dirty = true; }
+
+        if (act >= 0) {
+            const kkey_t *k = &s_keys[act];
+            if (k->kind == K_CHAR) kb_append(text, max, kb_upper(text) ? k->up : k->lo);
+            else if (k->kind == K_SPACE) { if (text[0] && !kb_upper(text)) kb_append(text, max, " "); }
+            else if (k->kind == K_DEL) kb_delete(text);
+            else if (k->kind == K_CANCEL) return false;
+            else if (k->kind == K_SEARCH && text[0]) return true;
+            dirty = true;
+        }
+        if (strlen(text) != before) msg[0] = 0;
+        if (dirty) {
+            kb_draw(text, sel, held, msg);
+            dirty = false;
+        }
+        papp_disp_present_ext(s_surf, s_img);
+        papp_delay_ms(20);
+    }
+    return false;
+}
+
+#define LABEL_MAX 31                     /* characters that fit a launcher menu line */
+
+/* Menu > Place: type a name, pick one of the matches. True if the place changed. */
+static bool choose_place(void)
+{
+    static char query[48];
+    char msg[96] = "";
+    static place_t found[7];                     /* what fits the launcher's menu */
+    if (!s_nkeys) kb_build();
+    query[0] = 0;
+    for (;;) {
+        if (!kb_edit(query, sizeof(query), msg)) return false;
+        kb_draw(query, -1, -1, "Searching...");
+        papp_disp_present_ext(s_surf, s_img);
+        int n, st = place_search(query, 7, found, &n);
+        if (st == PAPP_E_EXIT) return false;
+        if (st != 200) { net_error_text(msg, sizeof(msg), "search", st); continue; }
+        if (!n) { snprintf(msg, sizeof(msg), "No place called \"%s\" found", query); continue; }
+        int r = 0;
+        if (n > 1) {
+            static char labels[7][150];
+            const char *items[7];
+            for (int i = 0; i < n; i++) {
+                const place_t *pl = &found[i];
+                bool region = pl->admin1[0] && strcmp(pl->admin1, pl->name);
+                const char *land = pl->cc[0] ? pl->cc : pl->country;
+                snprintf(labels[i], sizeof(labels[i]), "%.47s%s%.47s, %.47s", pl->name, region ? ", " : "",
+                         region ? pl->admin1 : "", land);
+                if (papp_text_width(labels[i], 1) > LABEL_MAX * PAPP_FONT_W)   /* wider than the menu */
+                    snprintf(labels[i], sizeof(labels[i]), "%.40s, %.40s", pl->name, region ? pl->admin1 : land);
+                items[i] = labels[i];
+            }
+            r = papp_ui_menu("Which one?", items, n, 0);
+            if (r < 0) continue;                 /* back to the keyboard */
+        }
+        const place_t *pl = &found[r];
+        char place[64];
+        snprintf(place, sizeof(place), "%.40s, %.20s", pl->name, pl->country[0] ? pl->country : pl->admin1);
+        use_place(pl, place);
+        return true;
+    }
+}
+
 /* ── Main ───────────────────────────────────────────────────────────────── */
 
 /* `-- icons`: every icon by day (top) and night (bottom), for checking the drawings */
@@ -675,7 +940,7 @@ int main(int argc, char **argv)
     config_load();
     papp_surface_cfg_t sc = { .width = W, .height = H, .format = PAPP_PIXFMT_RGB565,
                               .scale = PAPP_SCALE_FIT_ASPECT, .buffers = 1 };
-    papp_surface_t *surf = papp_disp_surface_create(&sc);
+    papp_surface_t *surf = s_surf = papp_disp_surface_create(&sc);
     s_img = papp_alloc(W * H * 2, PAPP_MEM_ANY, 64);
     if (!surf || !s_img) return 1;
     C = (papp_canvas_t){ s_img, W, W, H };
@@ -721,16 +986,24 @@ int main(int argc, char **argv)
 
         if (press & PAPP_BTN_A) next_fetch = 0;
         if (tap || (press & (PAPP_BTN_X | PAPP_BTN_START))) {
-            const char *items[] = { "Refresh", cfg.imperial ? "Units: imperial" : "Units: metric", "Exit" };
-            int r = papp_ui_menu("Weather", items, 3, 0);
-            prev = 0xFFFFFFFFu;                /* ignore what closed the menu until released */
-            if (r == 2) break;
+            char place[64];
+            snprintf(place, sizeof(place), "Place: %.40s", cfg.name);
+            const char *items[] = { "Refresh", place, cfg.imperial ? "Units: imperial" : "Units: metric", "Exit" };
+            int r = papp_ui_menu("Weather", items, 4, 0);
+            if (r == 3) break;
             if (r == 0) next_fetch = 0;
-            if (r == 1) {
+            if (r == 1 && choose_place()) {
+                wx.ok = false;                 /* the old place's weather would mislead */
+                s_status[0] = 0;
+                next_fetch = 0;
+            }
+            if (r == 2) {
                 cfg.imperial = !cfg.imperial;
                 config_save();
                 next_fetch = 0;
             }
+            prev = 0xFFFFFFFFu;                /* ignore what closed the menu until released */
+            was_touch = false;
             dirty = true;
         }
 
